@@ -1,0 +1,585 @@
+package ch.rhosys.realtime.ui.search
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import ch.rhosys.realtime.data.local.location.LocationProvider
+import ch.rhosys.realtime.data.local.preferences.UserPreferencesRepository
+import ch.rhosys.realtime.data.local.routing.LocalRoutingState
+import ch.rhosys.realtime.data.local.routing.LocalTransportRepository
+import ch.rhosys.realtime.data.local.routing.algorithm.RoutingTime
+import ch.rhosys.realtime.domain.PlaceRepository
+import ch.rhosys.realtime.domain.RouteRepository
+import ch.rhosys.realtime.domain.TransportRepository
+import ch.rhosys.realtime.domain.model.Connection
+import ch.rhosys.realtime.domain.model.SearchEndpoint
+import ch.rhosys.realtime.domain.model.TripHistoryItem
+import ch.rhosys.realtime.ui.journey.JourneyStateHolder
+import ch.rhosys.realtime.ui.journey.TripReviewHolder
+import ch.rhosys.realtime.util.lowercaseAscii
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import javax.inject.Inject
+
+private val SWISS_ZONE = ZoneId.of("Europe/Zurich")
+
+data class ConnectionSearchUiState(
+    val fromText: String = "",
+    val toText: String = "",
+    val fromSuggestions: List<String> = emptyList(),
+    val toSuggestions: List<String> = emptyList(),
+    val isFromSuggesting: Boolean = false,
+    val isToSuggesting: Boolean = false,
+    val isFromLocating: Boolean = false,
+    val isToLocating: Boolean = false,
+    // Name of the nearest stop to the user's last-resolved GPS fix, shown on the
+    // "Current location" badge so the user can see it's actually working.
+    val fromBadgeStationName: String? = null,
+    val toBadgeStationName: String? = null,
+    val smartSuggestions: List<String> = emptyList(),
+    // Sorted by departure; earlier/later pages are merged in.
+    val connections: List<Connection> = emptyList(),
+    // Bumped on every new search, so the list starts again at the top.
+    val searchId: Int = 0,
+    val isLoading: Boolean = false,
+    val isLoadingEarlier: Boolean = false,
+    val isLoadingLater: Boolean = false,
+    // Set once a fetch in that direction finds nothing new, so the list stops asking.
+    val noMoreEarlier: Boolean = false,
+    val noMoreLater: Boolean = false,
+    val error: String? = null,
+    // "Now" (re-resolved on every query) or a time the user picked.
+    val timeMode: SearchTimeMode = SearchTimeMode.Now,
+    // Date the displayed results were queried for — earlier/later paging stays on it.
+    val searchDate: LocalDate = LocalDate.now(SWISS_ZONE),
+    // false = "depart after" the chosen time, true = "arrive by" it.
+    val isArriveBy: Boolean = false,
+    val showRecentSearches: Boolean = false,
+    val recentSearches: List<TripHistoryItem> = emptyList(),
+    // Stable key of the currently active (started) journey, if any of the displayed
+    // connections is it — drives the "already started" highlight on its card.
+    val activeConnectionKey: String? = null,
+    // Live from Settings — used to tell whether a tight transfer still covers a normal
+    // walk or only a run (see TransferInfo.requiresRunning).
+    val walkingPaceKmh: Float = 6f,
+    val runningPaceKmh: Float = 10f,
+) {
+    val fromIsCurrentLocation: Boolean get() = fromText == SearchEndpoint.CURRENT_LOCATION_LABEL
+    val toIsCurrentLocation: Boolean get() = toText == SearchEndpoint.CURRENT_LOCATION_LABEL
+}
+
+@HiltViewModel
+class ConnectionSearchViewModel @Inject constructor(
+    private val repository: TransportRepository,
+    private val localRouter: LocalTransportRepository,
+    private val routeRepository: RouteRepository,
+    private val placeRepository: PlaceRepository,
+    private val locationProvider: LocationProvider,
+    private val tripReviewHolder: TripReviewHolder,
+    private val searchNavigationBridge: SearchNavigationBridge,
+    private val journeyStateHolder: JourneyStateHolder,
+    private val userPreferencesRepository: UserPreferencesRepository,
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(ConnectionSearchUiState())
+    val uiState: StateFlow<ConnectionSearchUiState> = _uiState
+
+    private var fromSuggestJob: Job? = null
+    private var toSuggestJob: Job? = null
+    private var fromLocalSuggestJob: Job? = null
+    private var toLocalSuggestJob: Job? = null
+    private var autoSearchJob: Job? = null
+
+    // The exact endpoints the currently-displayed connections were resolved against —
+    // reused by openTripReview so the review matches what was actually searched instead
+    // of re-resolving "Current location" a second time against a possibly different fix.
+    private var lastResolvedFrom: SearchEndpoint? = null
+    private var lastResolvedTo: SearchEndpoint? = null
+
+    init {
+        viewModelScope.launch { loadSmartSuggestions() }
+
+        viewModelScope.launch {
+            journeyStateHolder.activeJourney.collect { journey ->
+                _uiState.value = _uiState.value.copy(activeConnectionKey = journey?.connection?.stableKey)
+            }
+        }
+        viewModelScope.launch {
+            userPreferencesRepository.walkingPaceKmh.collect { kmh ->
+                _uiState.value = _uiState.value.copy(walkingPaceKmh = kmh)
+            }
+        }
+        viewModelScope.launch {
+            userPreferencesRepository.runningPaceKmh.collect { kmh ->
+                _uiState.value = _uiState.value.copy(runningPaceKmh = kmh)
+            }
+        }
+    }
+
+    /**
+     * Applies from/to handed to the Search tab (e.g. from Home). Collected only while the
+     * search screen is shown — not while it sits under trip details or in a saved tab — so
+     * the tab can first see the request and come back to this screen.
+     */
+    suspend fun applyPendingRequests() {
+        searchNavigationBridge.pending.filterNotNull().collect { request ->
+            applyIncomingRequest(request)
+            searchNavigationBridge.consume()
+        }
+    }
+
+    private fun applyIncomingRequest(request: SearchNavigationBridge.Request) {
+        fromLocalSuggestJob?.cancel(); fromSuggestJob?.cancel()
+        toLocalSuggestJob?.cancel(); toSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            fromText = request.from,
+            toText = request.to,
+            fromSuggestions = emptyList(),
+            toSuggestions = emptyList(),
+            fromBadgeStationName = null,
+            toBadgeStationName = null,
+            timeMode = _uiState.value.timeMode.afterHomeTripRequest(),
+        )
+        scheduleAutoSearch(immediate = true)
+    }
+
+    private suspend fun loadSmartSuggestions() {
+        val seen = mutableSetOf<String>()
+        val result = mutableListOf<String>()
+
+        // 1. Closest saved places ≤3
+        val location = locationProvider.getLocationOrNull()
+        if (location != null) {
+            placeRepository.getPlaces().first()
+                .sortedBy { it.distanceMetersTo(location.first, location.second) }
+                .take(3)
+                .forEach { if (seen.add(it.name)) result.add(it.name) }
+        }
+
+        // 2. Last 4 actually travelled (wasLockedIn = true)
+        routeRepository.getRecentSearches(50)
+            .filter { it.wasLockedIn }
+            .distinctBy { it.toName }
+            .take(4)
+            .forEach { if (seen.add(it.toName)) result.add(it.toName) }
+
+        // 3. Last 4 searched (any)
+        routeRepository.getRecentSearches(50)
+            .distinctBy { it.toName }
+            .take(4)
+            .forEach { if (seen.add(it.toName)) result.add(it.toName) }
+
+        val current = _uiState.value
+        _uiState.value = current.copy(
+            smartSuggestions = result,
+            fromSuggestions = if (current.fromText.isEmpty()) result else current.fromSuggestions,
+            toSuggestions = if (current.toText.isEmpty()) result else current.toSuggestions,
+        )
+    }
+
+    fun toggleRecentSearches() {
+        val opening = !_uiState.value.showRecentSearches
+        _uiState.value = _uiState.value.copy(showRecentSearches = opening)
+        if (opening) {
+            viewModelScope.launch {
+                _uiState.value = _uiState.value.copy(recentSearches = routeRepository.getRecentSearches(20))
+            }
+        }
+    }
+
+    fun dismissRecentSearches() {
+        _uiState.value = _uiState.value.copy(showRecentSearches = false)
+    }
+
+    fun selectRecentSearch(item: TripHistoryItem) {
+        fromLocalSuggestJob?.cancel(); fromSuggestJob?.cancel()
+        toLocalSuggestJob?.cancel(); toSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            fromText = item.fromName,
+            toText = item.toName,
+            fromSuggestions = emptyList(),
+            toSuggestions = emptyList(),
+            fromBadgeStationName = null,
+            toBadgeStationName = null,
+            showRecentSearches = false,
+        )
+        scheduleAutoSearch(immediate = true)
+    }
+
+    // Suggestions come from two sources run in parallel: the on-device GTFS stop cache
+    // (instant, offline — see LocalTransportRepository.searchStopNames) and the live
+    // opendata.ch API (debounced 300ms, as before). Whichever answers first is shown
+    // immediately; the other merges in on top of it, deduplicated, when it lands.
+    fun onFromChanged(value: String) {
+        val smart = _uiState.value.smartSuggestions
+        _uiState.value = _uiState.value.copy(
+            fromText = value,
+            fromSuggestions = if (value.isEmpty()) smart else emptyList(),
+            fromBadgeStationName = null,
+        )
+        fromLocalSuggestJob?.cancel()
+        fromSuggestJob?.cancel()
+        if (value.length >= 2) {
+            _uiState.value = _uiState.value.copy(isFromSuggesting = true)
+            fromLocalSuggestJob = viewModelScope.launch {
+                val local = localRouter.searchStopNames(value).map { it.name }
+                _uiState.value = _uiState.value.copy(
+                    fromSuggestions = mergeSuggestionNames(local, _uiState.value.fromSuggestions)
+                )
+            }
+            fromSuggestJob = viewModelScope.launch {
+                delay(300)
+                runCatching { repository.getLocations(value) }
+                    .onSuccess { resp ->
+                        val remote = resp.stations.take(5).mapNotNull { it.name }
+                        _uiState.value = _uiState.value.copy(
+                            fromSuggestions = mergeSuggestionNames(_uiState.value.fromSuggestions, remote)
+                        )
+                    }
+                _uiState.value = _uiState.value.copy(isFromSuggesting = false)
+            }
+        } else {
+            _uiState.value = _uiState.value.copy(isFromSuggesting = false)
+        }
+        scheduleAutoSearch()
+    }
+
+    fun onToChanged(value: String) {
+        val smart = _uiState.value.smartSuggestions
+        _uiState.value = _uiState.value.copy(
+            toText = value,
+            toSuggestions = if (value.isEmpty()) smart else emptyList(),
+            toBadgeStationName = null,
+        )
+        toLocalSuggestJob?.cancel()
+        toSuggestJob?.cancel()
+        if (value.length >= 2) {
+            _uiState.value = _uiState.value.copy(isToSuggesting = true)
+            toLocalSuggestJob = viewModelScope.launch {
+                val local = localRouter.searchStopNames(value).map { it.name }
+                _uiState.value = _uiState.value.copy(
+                    toSuggestions = mergeSuggestionNames(local, _uiState.value.toSuggestions)
+                )
+            }
+            toSuggestJob = viewModelScope.launch {
+                delay(300)
+                runCatching { repository.getLocations(value) }
+                    .onSuccess { resp ->
+                        val remote = resp.stations.take(5).mapNotNull { it.name }
+                        _uiState.value = _uiState.value.copy(
+                            toSuggestions = mergeSuggestionNames(_uiState.value.toSuggestions, remote)
+                        )
+                    }
+                _uiState.value = _uiState.value.copy(isToSuggesting = false)
+            }
+        } else {
+            _uiState.value = _uiState.value.copy(isToSuggesting = false)
+        }
+        scheduleAutoSearch()
+    }
+
+    // ASCII-only lowercase for the dedup key — "Zürich" and "zurich" both matched the
+    // query, but they're different names and must not collapse into one suggestion.
+    private fun mergeSuggestionNames(before: List<String>, after: List<String>, max: Int = 5): List<String> {
+        val seen = mutableSetOf<String>()
+        val result = mutableListOf<String>()
+        for (name in before + after) {
+            if (seen.add(name.lowercaseAscii())) result.add(name)
+            if (result.size >= max) break
+        }
+        return result
+    }
+
+    fun selectFromSuggestion(name: String) {
+        fromLocalSuggestJob?.cancel()
+        fromSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            fromText = name, fromSuggestions = emptyList(), isFromSuggesting = false, fromBadgeStationName = null,
+        )
+        scheduleAutoSearch(immediate = true)
+    }
+
+    fun selectToSuggestion(name: String) {
+        toLocalSuggestJob?.cancel()
+        toSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            toText = name, toSuggestions = emptyList(), isToSuggesting = false, toBadgeStationName = null,
+        )
+        scheduleAutoSearch(immediate = true)
+    }
+
+    // Requests a brand-new GPS fix (never a stale cached one) and resolves the nearest
+    // stop name for the badge, so the field always reflects where the user actually is
+    // right now rather than wherever they were the last time this was tapped.
+    fun fillFromWithNearestStop() {
+        fromLocalSuggestJob?.cancel()
+        fromSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            fromText = SearchEndpoint.CURRENT_LOCATION_LABEL,
+            fromSuggestions = emptyList(),
+            isFromSuggesting = false,
+            isFromLocating = true,
+            fromBadgeStationName = null,
+        )
+        viewModelScope.launch {
+            val stationName = resolveCurrentLocationBadge()
+            _uiState.value = _uiState.value.copy(isFromLocating = false, fromBadgeStationName = stationName)
+            scheduleAutoSearch(immediate = true)
+        }
+    }
+
+    fun fillToWithNearestStop() {
+        toLocalSuggestJob?.cancel()
+        toSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            toText = SearchEndpoint.CURRENT_LOCATION_LABEL,
+            toSuggestions = emptyList(),
+            isToSuggesting = false,
+            isToLocating = true,
+            toBadgeStationName = null,
+        )
+        viewModelScope.launch {
+            val stationName = resolveCurrentLocationBadge()
+            _uiState.value = _uiState.value.copy(isToLocating = false, toBadgeStationName = stationName)
+            scheduleAutoSearch(immediate = true)
+        }
+    }
+
+    private suspend fun resolveCurrentLocationBadge(): String? {
+        val (lat, lng) = locationProvider.getFreshLocationOrNull() ?: return null
+        return localRouter.nearestStopName(lat, lng)
+            ?: runCatching { repository.getLocationsByCoordinate(lat, lng) }
+                .getOrNull()?.stations?.firstOrNull()?.name
+    }
+
+    // Debounced while typing; immediate right after a discrete selection (suggestion tap, GPS fill).
+    private fun scheduleAutoSearch(immediate: Boolean = false) {
+        autoSearchJob?.cancel()
+        if (_uiState.value.fromText.isBlank() || _uiState.value.toText.isBlank()) return
+        autoSearchJob = viewModelScope.launch {
+            if (!immediate) delay(500)
+            search()
+        }
+    }
+
+    // Resolves the "Current location" placeholder text (typed, tapped, or dragged in)
+    // into an actual coordinate-bearing endpoint using a freshly-requested fix — never a
+    // location computed for a previous search — falling back to a plain named lookup for
+    // everything else.
+    private suspend fun endpointFor(text: String): SearchEndpoint {
+        if (text == SearchEndpoint.CURRENT_LOCATION_LABEL) {
+            locationProvider.getFreshLocationOrNull()?.let { (lat, lng) ->
+                return SearchEndpoint.CurrentLocation(lat, lng)
+            }
+        }
+        return SearchEndpoint.NamedPlace(text)
+    }
+
+    fun onDateTimeSelected(dateTime: LocalDateTime) {
+        _uiState.value = _uiState.value.copy(timeMode = _uiState.value.timeMode.afterTimePicked(dateTime))
+        search()
+    }
+
+    fun onToggleArriveBy() {
+        _uiState.value = _uiState.value.copy(isArriveBy = !_uiState.value.isArriveBy)
+        search()
+    }
+
+    // Reverses the from/to endpoints in place and re-runs the search.
+    fun swapFromTo() {
+        val s = _uiState.value
+        _uiState.value = s.copy(
+            fromText = s.toText,
+            toText = s.fromText,
+            fromSuggestions = emptyList(),
+            toSuggestions = emptyList(),
+            fromBadgeStationName = s.toBadgeStationName,
+            toBadgeStationName = s.fromBadgeStationName,
+        )
+        scheduleAutoSearch(immediate = true)
+    }
+
+    fun search() {
+        val from = _uiState.value.fromText.trim()
+        val to   = _uiState.value.toText.trim()
+        if (to.isBlank()) return
+
+        viewModelScope.launch {
+            val queryAt = _uiState.value.timeMode.queryDateTime(
+                LocalDateTime.now(SWISS_ZONE),
+                _uiState.value.isArriveBy,
+            )
+            _uiState.value = _uiState.value.copy(
+                searchDate = queryAt.toLocalDate(),
+                isLoading = true,
+                error = null,
+                connections = emptyList(),
+                searchId = _uiState.value.searchId + 1,
+                isLoadingEarlier = false,
+                isLoadingLater = false,
+                noMoreEarlier = false,
+                noMoreLater = false,
+                fromSuggestions = emptyList(),
+                toSuggestions = emptyList(),
+            )
+
+            val fromEndpoint = endpointFor(from.ifBlank { to })
+            val toEndpoint = endpointFor(to)
+            lastResolvedFrom = fromEndpoint
+            lastResolvedTo = toEndpoint
+
+            val routingTime = routingTimeFor(queryAt.toLocalTime())
+            if (localRouter.hasData()) {
+                searchLocally(fromEndpoint, toEndpoint, routingTime)
+            } else {
+                searchViaApi(fromEndpoint, toEndpoint, queryAt.toLocalTime())
+            }
+        }
+    }
+
+    // The list asks for these when it's scrolled near the first / last connection.
+    fun loadEarlier() {
+        val state = _uiState.value
+        if (state.isLoadingEarlier || state.isLoading || state.noMoreEarlier) return
+        val first = state.connections.firstOrNull() ?: return
+        val firstDeparture = first.departure.scheduledTime?.atZone(SWISS_ZONE)?.toLocalTime()
+        if (firstDeparture == null || firstDeparture == LocalTime.MIDNIGHT) {
+            _uiState.value = state.copy(noMoreEarlier = true)
+            return
+        }
+
+        _uiState.value = state.copy(isLoadingEarlier = true)
+        viewModelScope.launch {
+            val from = endpointFor(state.fromText.trim().ifBlank { state.toText.trim() })
+            val to = endpointFor(state.toText.trim())
+            val earlier = fetchConnections(from, to, state.searchDate, firstDeparture.minusMinutes(1), isArriveBy = true)
+            val current = _uiState.value
+            if (current.searchId != state.searchId) return@launch
+            val merged = mergeConnections(current.connections, earlier)
+            _uiState.value = current.copy(
+                connections = merged,
+                isLoadingEarlier = false,
+                noMoreEarlier = merged.first().stableKey == current.connections.first().stableKey,
+            )
+        }
+    }
+
+    fun loadLater() {
+        val state = _uiState.value
+        if (state.isLoadingLater || state.isLoading || state.noMoreLater) return
+        val last = state.connections.lastOrNull() ?: return
+        val lastDeparture = last.departure.scheduledTime?.atZone(SWISS_ZONE)?.toLocalTime()
+        if (lastDeparture == null) {
+            _uiState.value = state.copy(noMoreLater = true)
+            return
+        }
+
+        _uiState.value = state.copy(isLoadingLater = true)
+        viewModelScope.launch {
+            val from = endpointFor(state.fromText.trim().ifBlank { state.toText.trim() })
+            val to = endpointFor(state.toText.trim())
+            val later = fetchConnections(from, to, state.searchDate, lastDeparture.plusMinutes(1), isArriveBy = false)
+            val current = _uiState.value
+            if (current.searchId != state.searchId) return@launch
+            val merged = mergeConnections(current.connections, later)
+            _uiState.value = current.copy(
+                connections = merged,
+                isLoadingLater = false,
+                noMoreLater = merged.last().stableKey == current.connections.last().stableKey,
+            )
+        }
+    }
+
+    private fun routingTimeFor(time: LocalTime): RoutingTime =
+        if (_uiState.value.isArriveBy) RoutingTime.ArriveBy(time) else RoutingTime.DepartAfter(time)
+
+    private suspend fun fetchConnections(
+        from: SearchEndpoint,
+        to: SearchEndpoint,
+        date: LocalDate,
+        time: LocalTime,
+        isArriveBy: Boolean,
+    ): List<Connection> {
+        if (localRouter.hasData()) {
+            val routingTime = if (isArriveBy) RoutingTime.ArriveBy(time) else RoutingTime.DepartAfter(time)
+            var result: List<Connection> = emptyList()
+            localRouter.routeConnections(
+                from = from, to = to, date = date, routingTime = routingTime,
+                walkingPaceKmh = userPreferencesRepository.walkingPaceKmh.first(),
+            ).collect { state -> if (state is LocalRoutingState.Results) result = state.connections }
+            return result
+        }
+        return runCatching {
+            repository.getConnections(from, to, date = date, time = time, isArrivalTime = isArriveBy)
+        }.getOrDefault(emptyList())
+    }
+
+    private suspend fun searchLocally(from: SearchEndpoint, to: SearchEndpoint, routingTime: RoutingTime) {
+        localRouter.routeConnections(
+            from = from,
+            to = to,
+            date = _uiState.value.searchDate,
+            routingTime = routingTime,
+            walkingPaceKmh = userPreferencesRepository.walkingPaceKmh.first(),
+        ).collect { state ->
+            when (state) {
+                is LocalRoutingState.Results -> _uiState.value = _uiState.value.copy(
+                    connections = mergeConnections(emptyList(), state.connections),
+                    isLoading = !state.isComplete,
+                )
+                is LocalRoutingState.NoResults -> _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    error = state.reason.ifBlank { null },
+                )
+                is LocalRoutingState.NoData -> searchViaApi(
+                    from, to,
+                    when (routingTime) {
+                        is RoutingTime.DepartAfter -> routingTime.time
+                        is RoutingTime.ArriveBy -> routingTime.time
+                    },
+                )
+                LocalRoutingState.Loading -> Unit
+            }
+        }
+    }
+
+    private suspend fun searchViaApi(from: SearchEndpoint, to: SearchEndpoint, time: LocalTime) {
+        val state = _uiState.value
+        runCatching {
+            repository.getConnections(
+                from, to,
+                date = state.searchDate,
+                time = time,
+                isArrivalTime = state.isArriveBy,
+            )
+        }
+            .onSuccess { connections ->
+                _uiState.value = _uiState.value.copy(
+                    connections = mergeConnections(emptyList(), connections),
+                    isLoading = false,
+                )
+            }
+            .onFailure { e ->
+                _uiState.value = _uiState.value.copy(isLoading = false, error = e.message ?: "Unknown error")
+            }
+    }
+
+    fun openTripReview(connection: Connection) {
+        val fromText = _uiState.value.fromText.trim()
+        val toText   = _uiState.value.toText.trim()
+        tripReviewHolder.set(
+            connection = connection,
+            from = lastResolvedFrom ?: SearchEndpoint.NamedPlace(fromText.ifBlank { toText }),
+            to   = lastResolvedTo ?: SearchEndpoint.NamedPlace(toText),
+        )
+    }
+}

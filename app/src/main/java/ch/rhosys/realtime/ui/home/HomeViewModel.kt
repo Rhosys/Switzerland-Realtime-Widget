@@ -1,0 +1,292 @@
+package ch.rhosys.realtime.ui.home
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import ch.rhosys.realtime.data.local.location.LocationProvider
+import ch.rhosys.realtime.data.local.routing.LocalTransportRepository
+import ch.rhosys.realtime.domain.PlaceRepository
+import ch.rhosys.realtime.domain.RouteRepository
+import ch.rhosys.realtime.domain.TransportRepository
+import ch.rhosys.realtime.domain.model.Connection
+import ch.rhosys.realtime.domain.model.Place
+import ch.rhosys.realtime.domain.model.RecurringRoute
+import ch.rhosys.realtime.domain.model.SavedRoute
+import ch.rhosys.realtime.domain.model.SearchEndpoint
+import ch.rhosys.realtime.ui.journey.JourneyStateHolder
+import ch.rhosys.realtime.ui.widget.JourneyWidgetSyncer
+import ch.rhosys.realtime.util.lowercaseAscii
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import java.time.DayOfWeek
+import java.time.Instant
+import java.time.LocalTime
+import java.time.ZonedDateTime
+import javax.inject.Inject
+
+data class ScorerResult(
+    val destination: String,
+    val connections: List<Connection>,
+    val from: SearchEndpoint,
+    val to: SearchEndpoint,
+)
+
+data class ActiveJourneyBanner(
+    val connection: Connection,
+    val from: SearchEndpoint,
+    val to: SearchEndpoint,
+)
+
+data class HomeUiState(
+    val isLoading: Boolean = true,
+    val places: List<Place> = emptyList(),
+    val scorerResult: ScorerResult? = null,
+    val activeJourney: ActiveJourneyBanner? = null,
+    val overlayHidden: Boolean = false,
+    // Display-only "From"/"To" values shown next to their pencil icons — editing the
+    // actual station happens on the search screen, not here.
+    val fromText: String = "",
+    val toText: String = "",
+    // The one editable field left on HomeScreen: "current location → this place".
+    val quickSearchText: String = "",
+    val quickSearchSuggestions: List<String> = emptyList(),
+    val isQuickSearchSuggesting: Boolean = false,
+)
+
+@HiltViewModel
+class HomeViewModel @Inject constructor(
+    private val locationProvider: LocationProvider,
+    private val placeRepository: PlaceRepository,
+    private val routeRepository: RouteRepository,
+    private val transportRepository: TransportRepository,
+    private val localRouter: LocalTransportRepository,
+    private val journeyStateHolder: JourneyStateHolder,
+    private val widgetSyncer: JourneyWidgetSyncer,
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(HomeUiState())
+    val uiState: StateFlow<HomeUiState> = _uiState
+
+    private var quickSearchSuggestJob: Job? = null
+    private var quickSearchLocalSuggestJob: Job? = null
+
+    init {
+        viewModelScope.launch { infer() }
+        viewModelScope.launch {
+            journeyStateHolder.activeJourney.collect { activeJourney ->
+                _uiState.value = _uiState.value.copy(
+                    activeJourney = if (activeJourney != null) {
+                        ActiveJourneyBanner(activeJourney.connection, activeJourney.from, activeJourney.to)
+                    } else null,
+                    // A newly locked-in journey should always surface, even if a previous one was hidden.
+                    overlayHidden = if (activeJourney != null) false else _uiState.value.overlayHidden,
+                )
+            }
+        }
+        viewModelScope.launch {
+            placeRepository.getPlaces().collect { places ->
+                _uiState.value = _uiState.value.copy(places = places)
+            }
+        }
+    }
+
+    fun refresh() {
+        viewModelScope.launch { infer() }
+    }
+
+    fun onLocationPermissionGranted() {
+        locationProvider.start()
+        refresh()
+    }
+
+    // The bottom quick-search field always means "current location → this place",
+    // so typing here only ever updates the "To" display and its own suggestions.
+    // Local GTFS cache (instant, offline) and the live API (debounced) run in parallel;
+    // each merges its results into whatever's already showing, deduplicated by an
+    // ASCII-only lowercase key so accented station names never collapse together.
+    fun onQuickSearchTextChanged(value: String) {
+        _uiState.value = _uiState.value.copy(quickSearchText = value, quickSearchSuggestions = emptyList())
+        quickSearchLocalSuggestJob?.cancel()
+        quickSearchSuggestJob?.cancel()
+        if (value.length >= 2) {
+            _uiState.value = _uiState.value.copy(isQuickSearchSuggesting = true)
+            quickSearchLocalSuggestJob = viewModelScope.launch {
+                val local = localRouter.searchStopNames(value).map { it.name }
+                _uiState.value = _uiState.value.copy(
+                    quickSearchSuggestions = mergeSuggestionNames(local, _uiState.value.quickSearchSuggestions)
+                )
+            }
+            quickSearchSuggestJob = viewModelScope.launch {
+                delay(300)
+                runCatching { transportRepository.getLocations(value) }
+                    .onSuccess { resp ->
+                        val remote = resp.stations.take(5).mapNotNull { it.name }
+                        _uiState.value = _uiState.value.copy(
+                            quickSearchSuggestions = mergeSuggestionNames(_uiState.value.quickSearchSuggestions, remote)
+                        )
+                    }
+                _uiState.value = _uiState.value.copy(isQuickSearchSuggesting = false)
+            }
+        } else {
+            _uiState.value = _uiState.value.copy(isQuickSearchSuggesting = false)
+        }
+    }
+
+    private fun mergeSuggestionNames(before: List<String>, after: List<String>, max: Int = 5): List<String> {
+        val seen = mutableSetOf<String>()
+        val result = mutableListOf<String>()
+        for (name in before + after) {
+            if (seen.add(name.lowercaseAscii())) result.add(name)
+            if (result.size >= max) break
+        }
+        return result
+    }
+
+    fun selectQuickSearchSuggestion(name: String) {
+        quickSearchLocalSuggestJob?.cancel()
+        quickSearchSuggestJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            quickSearchText = name,
+            quickSearchSuggestions = emptyList(),
+            isQuickSearchSuggesting = false,
+        )
+    }
+
+    // We're already continuously tracking location (see LocationProvider), so this is
+    // instant off the cached value — no spinner, no wait. A missing fix leaves the
+    // field untouched rather than clearing it. A background refresh is kicked off
+    // for next time.
+    fun fillFromWithNearestStop() {
+        locationProvider.refreshNow()
+        if (locationProvider.currentLocation.value == null) return
+        _uiState.value = _uiState.value.copy(fromText = SearchEndpoint.CURRENT_LOCATION_LABEL)
+    }
+
+    fun fillToWithNearestStop() {
+        locationProvider.refreshNow()
+        if (locationProvider.currentLocation.value == null) return
+        _uiState.value = _uiState.value.copy(toText = SearchEndpoint.CURRENT_LOCATION_LABEL)
+    }
+
+    fun hideOverlay() {
+        _uiState.value = _uiState.value.copy(overlayHidden = true)
+    }
+
+    fun showOverlay() {
+        _uiState.value = _uiState.value.copy(overlayHidden = false)
+    }
+
+    private suspend fun infer() {
+        _uiState.value = _uiState.value.copy(isLoading = true)
+        val location = locationProvider.getLocationOrNull()
+        val candidate = scoreBestCandidate()
+
+        if (candidate != null) {
+            val from = if (location != null)
+                SearchEndpoint.CurrentLocation(location.first, location.second)
+            else
+                SearchEndpoint.NamedPlace("")
+
+            val connections = runCatching {
+                transportRepository.getConnections(from, candidate.toDestinationEndpoint())
+            }.getOrNull() ?: emptyList()
+
+            if (connections.isNotEmpty()) {
+                val result = ScorerResult(
+                    destination = candidate.destinationName,
+                    connections = connections,
+                    from = from,
+                    to = candidate.toDestinationEndpoint(),
+                )
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    scorerResult = result,
+                )
+                notifyWidget(result)
+                return
+            }
+        }
+
+        _uiState.value = _uiState.value.copy(isLoading = false)
+        widgetSyncer.clearScorerResult()
+    }
+
+    private fun notifyWidget(result: ScorerResult) {
+        val best = result.connections.first()
+        widgetSyncer.onScorerResult(
+            to = result.destination,
+            departTime = best.departure.displayTime(),
+            arriveTime = best.arrival.displayTime(),
+            lines = best.lineNames.joinToString(" · "),
+        )
+    }
+
+    private suspend fun scoreBestCandidate(): SavedRoute? {
+        val now = Instant.now()
+        val windowEnd = now.plusSeconds(2 * 60 * 60)
+
+        val savedRoutes = routeRepository.getSavedRoutes().first()
+        val imminentRoute = savedRoutes
+            .filter { route ->
+                val scheduledAt = route.scheduledAt ?: return@filter false
+                scheduledAt.isAfter(now) && scheduledAt.isBefore(windowEnd)
+            }
+            .minByOrNull { it.scheduledAt!! }
+        if (imminentRoute != null) return imminentRoute
+
+        val recurringRoutes = routeRepository.getRecurringRoutes().first()
+        val recurringCandidate = recurringRoutes
+            .filter { !it.isPaused && it.matchesToday() }
+            .filter { route ->
+                val deptTime = LocalTime.of(route.departureHour, route.departureMinute)
+                val nowTime = LocalTime.now()
+                deptTime.isAfter(nowTime.minusMinutes(5)) && deptTime.isBefore(nowTime.plusHours(2))
+            }
+            .minByOrNull { route ->
+                LocalTime.of(route.departureHour, route.departureMinute).toSecondOfDay()
+            }
+        if (recurringCandidate != null) {
+            return SavedRoute(
+                id = -1,
+                label = recurringCandidate.label,
+                destinationName = recurringCandidate.destinationName,
+                destinationLat = recurringCandidate.destinationLat,
+                destinationLng = recurringCandidate.destinationLng,
+                scheduledAt = null,
+            )
+        }
+
+        return null
+    }
+}
+
+private fun RecurringRoute.matchesToday(): Boolean {
+    val dayCode = when (ZonedDateTime.now().dayOfWeek) {
+        DayOfWeek.MONDAY    -> "MO"
+        DayOfWeek.TUESDAY   -> "TU"
+        DayOfWeek.WEDNESDAY -> "WE"
+        DayOfWeek.THURSDAY  -> "TH"
+        DayOfWeek.FRIDAY    -> "FR"
+        DayOfWeek.SATURDAY  -> "SA"
+        DayOfWeek.SUNDAY    -> "SU"
+        else                -> return false
+    }
+
+    val rules = rrule.split(";").mapNotNull { part ->
+        val idx = part.indexOf('=')
+        if (idx < 0) null else part.substring(0, idx) to part.substring(idx + 1)
+    }.toMap()
+
+    return when (rules["FREQ"]) {
+        "DAILY"   -> true
+        "WEEKLY"  -> {
+            val byday = rules["BYDAY"] ?: return true
+            dayCode in byday.split(",")
+        }
+        else -> false
+    }
+}

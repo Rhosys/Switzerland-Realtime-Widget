@@ -1,0 +1,238 @@
+package ch.rhosys.realtime.worker
+
+import android.content.Context
+import androidx.hilt.work.HiltWorker
+import androidx.work.Constraints
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
+import ch.rhosys.realtime.data.local.routing.LocalTransportRepository
+import ch.rhosys.realtime.data.local.routing.gtfs.GtfsNetworkStore
+import ch.rhosys.realtime.data.local.routing.gtfs.GtfsParser
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedInject
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.tukaani.xz.XZInputStream
+import java.io.File
+import java.io.InputStream
+import java.time.DayOfWeek
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.temporal.ChronoUnit
+import java.time.temporal.TemporalAdjusters
+import java.util.concurrent.TimeUnit
+import java.util.zip.GZIPInputStream
+import java.util.zip.ZipInputStream
+
+private const val REFRESH_INTERVAL_DAYS = 1L
+
+private val NEEDED_FILES = setOf(
+    "stops.txt", "routes.txt", "trips.txt", "stop_times.txt",
+    "calendar.txt", "calendar_dates.txt", "transfers.txt",
+)
+
+@HiltWorker
+class GtfsImportWorker @AssistedInject constructor(
+    @Assisted context: Context,
+    @Assisted params: WorkerParameters,
+    private val okHttpClient: OkHttpClient,
+    private val store: GtfsNetworkStore,
+    private val localRepo: LocalTransportRepository,
+) : CoroutineWorker(context, params) {
+
+    override suspend fun doWork(): Result {
+        val url = inputData.getString(KEY_URL) ?: GTFS_FEED_URL
+        val requestBuilder = Request.Builder().url(url)
+        store.lastEtag()?.let { requestBuilder.header("If-None-Match", it) }
+
+        val response = try {
+            okHttpClient.newCall(requestBuilder.build()).execute()
+        } catch (e: Exception) {
+            return if (runAttemptCount < 3) Result.retry() else Result.failure()
+        }
+
+        if (response.code == 304) {
+            response.close()
+            return Result.success()
+        }
+
+        if (!response.isSuccessful) {
+            response.close()
+            return if (runAttemptCount < 3) Result.retry() else Result.failure()
+        }
+
+        val newEtag = response.header("ETag")
+
+        val files = try {
+            response.body!!.use { body ->
+                extractGtfsFiles(body.byteStream())
+            }
+        } catch (e: Exception) {
+            return if (runAttemptCount < 3) Result.retry() else Result.failure()
+        }
+
+        val parsed = try {
+            GtfsParser().parse(files)
+        } catch (e: Exception) {
+            return Result.failure()
+        }
+
+        store.write(parsed)
+        if (newEtag != null) store.writeEtag(newEtag)
+        store.writeUrl(url)
+        localRepo.invalidate()
+        scheduleFahrplanwechsel(applicationContext)
+        return Result.success()
+    }
+
+    private fun extractGtfsFiles(inputStream: InputStream): Map<String, String> {
+        val buf = inputStream.buffered()
+        buf.mark(6)
+        val magic = ByteArray(6).also { buf.read(it) }
+        buf.reset()
+        return when {
+            // ZIP: PK\x03\x04
+            magic[0] == 0x50.toByte() && magic[1] == 0x4B.toByte() ->
+                extractZip(buf)
+            // XZ: \xFD7zXZ\x00
+            magic[0] == 0xFD.toByte() && magic[1] == 0x37.toByte() && magic[2] == 0x7A.toByte() ->
+                extractTar(XZInputStream(buf))
+            // GZip / tar.gz: \x1F\x8B
+            magic[0] == 0x1F.toByte() && magic[1] == 0x8B.toByte() ->
+                extractTar(GZIPInputStream(buf))
+            // Bare TAR (or unknown — let TarArchiveInputStream throw if not a tar)
+            else ->
+                extractTar(buf)
+        }
+    }
+
+    private fun extractZip(inputStream: InputStream): Map<String, String> =
+        ZipInputStream(inputStream).use { zip ->
+            buildMap<String, String> {
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory && entry.name in NEEDED_FILES) {
+                        put(entry.name, zip.readBytes().toString(Charsets.UTF_8))
+                    }
+                    entry = zip.nextEntry
+                }
+            }
+        }
+
+    private fun extractTar(inputStream: InputStream): Map<String, String> =
+        TarArchiveInputStream(inputStream).use { tar ->
+            buildMap<String, String> {
+                var entry = tar.nextEntry
+                while (entry != null) {
+                    val name = entry.name.substringAfterLast('/')
+                    if (!entry.isDirectory && name in NEEDED_FILES) {
+                        put(name, tar.readBytes().toString(Charsets.UTF_8))
+                    }
+                    entry = tar.nextEntry
+                }
+            }
+        }
+
+    companion object {
+        private const val WORK_NAME = "gtfs_import"
+        private const val FAHRPLANWECHSEL_WORK_NAME = "gtfs_import_fahrplanwechsel"
+        private const val FAHRPLANWECHSEL_STARTUP_WORK_NAME = "gtfs_import_startup_stale"
+        const val KEY_URL = "gtfs_url"
+
+        const val GTFS_FEED_URL = "https://opentransportdata.swiss/en/dataset/timetable-gtfs/permalink/resource/gtfs_fp.zip"
+        private val SWISS_ZONE = ZoneId.of("Europe/Zurich")
+
+        fun schedule(context: Context) {
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                WORK_NAME,
+                ExistingPeriodicWorkPolicy.UPDATE,
+                PeriodicWorkRequestBuilder<GtfsImportWorker>(REFRESH_INTERVAL_DAYS, TimeUnit.DAYS)
+                    .setConstraints(
+                        Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.UNMETERED)
+                            .setRequiresBatteryNotLow(true)
+                            .build()
+                    )
+                    .build()
+            )
+            scheduleFahrplanwechsel(context)
+            scheduleImmediateIfStale(context)
+        }
+
+        // On startup: if we are 0–3 days after a Fahrplanwechsel and the stored data
+        // pre-dates that switch, enqueue an immediate check. The ETag is always sent —
+        // the server returns 304 if the feed hasn't changed yet, 200 with new data if it has.
+        fun scheduleImmediateIfStale(context: Context) {
+            val today = LocalDate.now(SWISS_ZONE)
+            val thisYearSwitch = fahrplanwechselDate(today.year)
+            val mostRecentSwitch = if (!today.isBefore(thisYearSwitch)) thisYearSwitch
+                                   else fahrplanwechselDate(today.year - 1)
+
+            // daysFromSwitch is always ≥ 0: mostRecentSwitch is always a past date.
+            val daysFromSwitch = ChronoUnit.DAYS.between(mostRecentSwitch, today)
+            if (daysFromSwitch !in 0..3) return
+
+            val switchEpochMs = mostRecentSwitch.atTime(4, 0).atZone(SWISS_ZONE).toInstant().toEpochMilli()
+            val lastImportMs = File(context.filesDir, "gtfs/meta.txt")
+                .runCatching { readText().trim().toLong() }.getOrDefault(0L)
+            if (lastImportMs >= switchEpochMs) return
+
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                FAHRPLANWECHSEL_STARTUP_WORK_NAME,
+                ExistingWorkPolicy.KEEP,
+                OneTimeWorkRequestBuilder<GtfsImportWorker>()
+                    .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                    .build(),
+            )
+        }
+
+        // Schedules a one-shot run at 04:00 Swiss time on the next Fahrplanwechsel Sunday
+        // (second Sunday of December). Constraints are relaxed — metered network and low
+        // battery are both acceptable because the changeover only happens once a year.
+        fun scheduleFahrplanwechsel(context: Context) {
+            val nowDate = LocalDate.now(SWISS_ZONE)
+            val nextSwitch = nextFahrplanwechsel(nowDate)
+            val runAt = nextSwitch.atTime(4, 0).atZone(SWISS_ZONE)
+            val delayMs = runAt.toInstant().toEpochMilli() - System.currentTimeMillis()
+            if (delayMs <= 0) return
+
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                FAHRPLANWECHSEL_WORK_NAME,
+                ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<GtfsImportWorker>()
+                    .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
+                    .setConstraints(
+                        Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build()
+                    )
+                    .build()
+            )
+        }
+
+        fun nextFahrplanwechsel(from: LocalDate): LocalDate {
+            val thisYear = fahrplanwechselDate(from.year)
+            return if (!from.isAfter(thisYear)) thisYear else fahrplanwechselDate(from.year + 1)
+        }
+
+        // Second Sunday of December — the Swiss annual timetable changeover date.
+        fun fahrplanwechselDate(year: Int): LocalDate {
+            val firstSunday = LocalDate.of(year, 12, 1)
+                .with(TemporalAdjusters.nextOrSame(DayOfWeek.SUNDAY))
+            return firstSunday.plusWeeks(1)
+        }
+
+        fun cancel(context: Context) {
+            WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
+            WorkManager.getInstance(context).cancelUniqueWork(FAHRPLANWECHSEL_WORK_NAME)
+            WorkManager.getInstance(context).cancelUniqueWork(FAHRPLANWECHSEL_STARTUP_WORK_NAME)
+        }
+    }
+}
