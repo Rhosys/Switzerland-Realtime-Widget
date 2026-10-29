@@ -88,35 +88,22 @@ dependencies {
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.play.services)
-    implementation(libs.play.services.wearable)
     implementation(libs.datastore.preferences)
     implementation(libs.posthog.android)
 
-    // Room — local database (places, saved routes, history)
-    implementation(libs.room.runtime)
-    implementation(libs.room.ktx)
-    ksp(libs.room.compiler)
-
-    // WorkManager — calendar sync + journey monitoring
+    // WorkManager — background forecast refresh
     implementation(libs.work.runtime.ktx)
     implementation(libs.hilt.work)
     ksp(libs.hilt.ext.compiler)
 
-    // Location — GPS for multi-origin origin resolution
+    // Location — forecast for the current position
     implementation(libs.play.services.location)
 
     // Glance — home-screen widget
     implementation(libs.glance.appwidget)
     implementation(libs.glance.material3)
 
-    // Image loading — place tile photos
-    implementation(libs.coil.compose)
-
-    // Archive extraction — GTFS feed may arrive as zip, tar, tar.gz, or tar.xz
-    implementation(libs.commons.compress)
-    implementation(libs.xz.java)
-
-    // Networking — direct calls to transport.opendata.ch (public, no auth)
+    // Networking — direct calls to api.open-meteo.com (public, no auth)
     implementation(libs.retrofit)
     implementation(libs.retrofit.serialization)
     implementation(libs.okhttp.logging)

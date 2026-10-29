@@ -1,11 +1,7 @@
 package ch.rhosys.realtime.di
 
 import ch.rhosys.realtime.BuildConfig
-import ch.rhosys.realtime.data.remote.ApiTransportRepository
-import ch.rhosys.realtime.data.remote.TransportApi
-import ch.rhosys.realtime.domain.TransportRepository
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
-import dagger.Binds
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -17,7 +13,7 @@ import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import javax.inject.Singleton
 
-private const val BASE_URL = "https://transport.opendata.ch/"
+private const val BASE_URL = "https://api.open-meteo.com/"
 
 @Module
 @InstallIn(SingletonComponent::class)
@@ -48,17 +44,4 @@ object NetworkModule {
             .client(okHttpClient)
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
-
-    @Provides
-    @Singleton
-    fun provideTransportApi(retrofit: Retrofit): TransportApi =
-        retrofit.create(TransportApi::class.java)
-}
-
-@Module
-@InstallIn(SingletonComponent::class)
-abstract class TransportRepositoryModule {
-    @Binds
-    @Singleton
-    abstract fun bindTransportRepository(impl: ApiTransportRepository): TransportRepository
 }

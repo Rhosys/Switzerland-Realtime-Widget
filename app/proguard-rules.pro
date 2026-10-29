@@ -8,10 +8,10 @@
 # kotlinx.serialization — keep generated serializers for DTO classes
 -keepattributes *Annotation*, InnerClasses
 -dontnote kotlinx.serialization.**
--keepclassmembers class ch.rhosys.realtime.data.remote.dto.** {
+-keepclassmembers class ch.rhosys.realtime.data.remote.** {
     *** Companion;
 }
--keepclasseswithmembers class ch.rhosys.realtime.data.remote.dto.** {
+-keepclasseswithmembers class ch.rhosys.realtime.data.remote.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
 

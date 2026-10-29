@@ -15,4 +15,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "SwitzerlandRealtimeWidget"
 include(":app")
-include(":wear")

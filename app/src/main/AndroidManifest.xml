@@ -6,16 +6,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <!-- Requested contextually at trip lock-in, not at install -->
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
-    <!-- Calendar sync — requested contextually when user enables in Settings -->
-    <uses-permission android:name="android.permission.READ_CALENDAR" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- Departure reminders — requested contextually in Settings (API 33+) -->
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Persistent active-journey progress notification -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:name=".RealtimeApp"
@@ -37,34 +27,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <receiver
-            android:name=".ui.journey.JourneyGeofenceReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="ch.rhosys.realtime.GEOFENCE_TRANSITION" />
-            </intent-filter>
-        </receiver>
-
-        <service
-            android:name=".notification.JourneyNotificationService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="active-journey-progress-notification" />
-        </service>
-
-        <receiver
-            android:name=".ui.widget.DepartureWidgetReceiver"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
-            </intent-filter>
-            <meta-data
-                android:name="android.appwidget.provider"
-                android:resource="@xml/departure_widget_info" />
-        </receiver>
 
         <!-- Remove default WorkManager initializer so HiltWorkerFactory can be provided -->
         <provider
